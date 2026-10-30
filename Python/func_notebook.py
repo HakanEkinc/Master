@@ -33,9 +33,9 @@ peak_end_64 = 578
 
 #Sample window for 4CH digitizer
 baseline_start_4 = 0
-baseline_end_4 = 700
-peak_start_4 = 760
-peak_end_4 = 850
+baseline_end_4 = 50
+peak_start_4 = 270
+peak_end_4 = 390
 
 #Folders where the data will be stored
 parquet_folder = "/home/uzh/hekinc/Master/Python/parquets"
@@ -46,7 +46,7 @@ comparisons_folder = "/home/uzh/hekinc/Master/Python/plots/comparisons"
 #ROOT DATA 
 ####################################################################
 
-
+'''
 def analyse_root_data_static(filepath, parquet_folder=None, device=None, suffix=None, apply_3sigma_cut=True):
     analyzed_data = [] # List to hold our chunks
 
@@ -119,20 +119,17 @@ def analyse_root_data_static(filepath, parquet_folder=None, device=None, suffix=
     print(f"Data successfully saved to {final_parquet_path}")
         
     return master_df, final_parquet_path
+'''
 
 
 
 
 
-
-def analyse_root_data(filepath, parquet_folder=None, device=None, suffix=None, apply_3sigma_cut=True):
+def analyse_root_data(filepath, parquet_folder=None, suffix=None, apply_3sigma_cut=True):
     # Determine integration windows based on device
-    if device is not None:
-        baseline_start, baseline_end = baseline_start_4, baseline_end_4
-        peak_start, peak_end = peak_start_4, peak_end_4
-    else:
-        baseline_start, baseline_end = baseline_start_64, baseline_end_64
-        peak_start, peak_end = peak_start_64, peak_end_64
+    
+    baseline_start, baseline_end = baseline_start_64, baseline_end_64
+    peak_start, peak_end = peak_start_64, peak_end_64
 
     # Setup output path
     original_name = Path(filepath).parent.name
@@ -223,7 +220,157 @@ def analyse_root_data(filepath, parquet_folder=None, device=None, suffix=None, a
     else:
         print("No valid events found to save.")
 
-    return final_parquet_path
+
+
+
+
+
+
+
+
+
+
+
+
+
+def analyse_root_data_type_b(filepath, parquet_folder=None, suffix=None, apply_3sigma_cut=True):
+    """
+    Processes File Type B: 
+    Data stored in "Data_R;X" trees with "Samples" and "Channel" branches.
+    Finds POSITIVE peaks.
+    """
+    # Determine integration windows based on device
+    baseline_start, baseline_end = baseline_start_4, baseline_end_4
+    peak_start, peak_end = peak_start_4, peak_end_4
+    
+
+    # Setup output path
+    filepath_str = str(filepath)
+    original_name = Path(filepath).stem
+    if suffix is not None:
+        original_name += f"_{suffix}"
+        
+    if parquet_folder is None:
+        parquet_folder = Path(filepath).parent
+        
+    final_parquet_path = Path(parquet_folder) / f"{original_name}.parquet"
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    pq_writer = None
+
+    # 1. IDENTIFY ALL RELEVANT TREES
+    with uproot.open(filepath_str) as f:
+        keys = f.keys()
+        data_r_keys = [k for k in keys if k.startswith("Data_R")]
+
+    if not data_r_keys:
+        print(f"No 'Data_R' trees found in {filepath_str}")
+        return None
+
+    # 2. PROCESS IN CHUNKS ACROSS ALL TREES
+    for tree_key in data_r_keys:
+        for chunk in uproot.iterate({filepath_str: tree_key}, filter_name=["Samples", "Channel"], library="np", step_size="100 MB"):
+            
+            samples = chunk["Samples"]
+            channels = chunk["Channel"]
+            unique_channels = np.unique(channels)
+            
+            chunk_results = []
+            
+            for ch in unique_channels:
+                channel_name = f"ch{int(ch):02d}"
+                mask = (channels == ch)
+                waveforms = samples[mask]
+                
+                # --- EXACT COMPUTATION LOGIC START ---
+                if waveforms.dtype == 'O': 
+                    waveforms = np.vstack(waveforms)
+                    
+                # Array Safety Checks
+                if len(waveforms) == 0:
+                    continue
+                    
+                num_samples = waveforms.shape[1]
+                if peak_start >= num_samples or baseline_start >= num_samples:
+                    continue
+                if peak_start >= peak_end:
+                    raise ValueError(f"Invalid peak window: start ({peak_start}) must be less than end ({peak_end}).")
+
+                # Baseline calculations
+                baseline_window = waveforms[:, baseline_start:baseline_end] 
+                baselines = np.mean(baseline_window, axis=1)
+                std_devs = np.std(baseline_window, axis=1)
+                    
+                corrected_waveforms = waveforms - baselines[:, None]
+                corrected_peak_window = corrected_waveforms[:, peak_start:peak_end]
+                
+                # --- CHANGED: Find POSITIVE peaks specifically (maximum values) ---
+                peaks = np.argmax(corrected_peak_window, axis=1) + peak_start
+                peak_values = corrected_waveforms[np.arange(len(waveforms)), peaks]
+                
+                # --- CHANGED: 3-Sigma Cut toggle (Positive Side) ---
+                if apply_3sigma_cut:
+                    valid_mask = peak_values > (3 * std_devs)
+                else:
+                    valid_mask = np.ones(len(peak_values), dtype=bool)
+                
+                # OPTIMIZATION: Filter arrays BEFORE doing heavy Numpy math
+                valid_waveforms = corrected_waveforms[valid_mask]
+                valid_peaks = peaks[valid_mask]
+                valid_baselines = baselines[valid_mask]
+                valid_std_devs = std_devs[valid_mask]
+                
+                if len(valid_waveforms) == 0:
+                    continue 
+
+                # Pure NumPy zero-crossing and integration (applied ONLY to valid signals)
+                num_samples = valid_waveforms.shape[1]
+                indices = np.arange(num_samples)
+                
+                # --- CHANGED: Look for crossings below baseline for positive peaks ---
+                below_baseline = (valid_waveforms <= 0)
+
+                left_valid = below_baseline & (indices < valid_peaks[:, None])
+                left_crossings = np.max(np.where(left_valid, indices, 0), axis=1)
+
+                right_valid = below_baseline & (indices > valid_peaks[:, None])
+                right_crossings = np.min(np.where(right_valid, indices, num_samples - 1), axis=1)
+
+                integration_mask = (indices >= left_crossings[:, None]) & (indices <= right_crossings[:, None])
+                integrals = -1 *np.sum(valid_waveforms * integration_mask, axis=1)
+
+                # Build DataFrame only for valid signals
+                chunk_df = pd.DataFrame({
+                    "channel": channel_name,
+                    "baseline": valid_baselines,
+                    "std_dev": valid_std_devs,
+                    "peak_integral": integrals
+                })
+                chunk_results.append(chunk_df)
+                # --- EXACT COMPUTATION LOGIC END ---
+
+            # 3. STREAM DIRECTLY TO PARQUET
+            if chunk_results:
+                combined_chunk = pd.concat(chunk_results, ignore_index=True)
+                table = py.Table.from_pandas(combined_chunk)
+                
+                if pq_writer is None:
+                    pq_writer = pq.ParquetWriter(final_parquet_path, table.schema)
+                pq_writer.write_table(table)
+
+    # 4. FINALIZE AND RETURN
+    if pq_writer is not None:
+        pq_writer.close()
+        print(f"Data successfully saved to {final_parquet_path}")
+    else:
+        print("No valid events found to save.")
+
+
+   
+
+
+
+
 
 
 
@@ -1468,13 +1615,26 @@ def process_all_parquet_files_in_folder_to_canvas(parquet_folder, output_folder,
 
 
 
+def has_events_tree(filepath):
+    """
+    Scans a ROOT file and returns True if it contains an 'Events' tree, 
+    False otherwise.
+    """
+    filepath_str = str(filepath)
+    try:
+        with uproot.open(filepath_str) as f:
+            base_keys = [k.split(';')[0] for k in f.keys()]
+            return "Events" in base_keys
+    except Exception as e:
+        print(f"Error reading {filepath_str} for tree check: {e}")
+        return False
 
-from pathlib import Path
 
 def create_all_parquet_files_from_root_folder(root_folder, parquet_folder):
     """
-    Recursively searches for all ROOT files in the specified folder and its subfolders,
-    processes each file, and saves the results to a corresponding Parquet file.
+    Recursively searches for all ROOT files, checks their internal tree structure, 
+    processes each file with the appropriate function, and names the Parquet 
+    files based on their type.
     """
     root_folder_path = Path(root_folder)
     parquet_folder_path = Path(parquet_folder)
@@ -1490,26 +1650,43 @@ def create_all_parquet_files_from_root_folder(root_folder, parquet_folder):
     no_of_files = 0
     
     for counter, root_file in enumerate(root_files, start=1):
-        # Determine what the output file will be named (matching logic in analyse_root_data)
-        original_name = root_file.parent.name
+        # 1. DETERMINE FILE TYPE FIRST
+        # We must know the type to know what the output file will be named
+        is_type_a = has_events_tree(root_file)
+        
+        if is_type_a:
+            # Type A: Named after the parent folder
+            original_name = root_file.parent.name
+            file_type_msg = "Type A ('Events' tree)"
+        else:
+            # Type B: Named after the file itself
+            original_name = root_file.stem
+            file_type_msg = "Type B ('Data_R' tree)"
+            
         expected_parquet_path = parquet_folder_path / f"{original_name}.parquet"
         
-        # 1. SKIP ALREADY PROCESSED FILES
+        # 2. SKIP ALREADY PROCESSED FILES
         if expected_parquet_path.exists():
             print(f"\n[{counter}/{len(root_files)}] Skipping {original_name} - Parquet file already exists.")
             no_of_files += 1 
             continue
             
-        print(f"\n[{counter}/{len(root_files)}] Processing ROOT file: {original_name}")
+        print(f"\n[{counter}/{len(root_files)}] Processing {file_type_msg}: {root_file.name} -> {original_name}.parquet")
         
-        # 2. ERROR HANDLING
+        # 3. ROUTE TO CORRECT FUNCTION & ERROR HANDLING
         try:
-            analyse_root_data(root_file, parquet_folder=parquet_folder) 
+            if is_type_a:
+                analyse_root_data(root_file, parquet_folder=parquet_folder) 
+            else:
+                analyse_root_data_type_b(root_file, parquet_folder=parquet_folder)
+                
             no_of_files += 1 
+            
         except Exception as e:
-            print(f"FAILED to process {original_name}. Error: {e}")
+            print(f"FAILED to process {root_file.name}. Error: {e}")
             continue 
-    print(f"{no_of_files} parquet files created" )
+            
+    print(f"\n{no_of_files} parquet files processed or created.")
             
 
 
@@ -2076,18 +2253,20 @@ def get_parquet_files(folder_path):
 
 def get_matching_root_files(parquet_files, root_base_folder):
     """
-    Finds corresponding ROOT files for Parquet files. Allows Parquet files 
-    to have extra suffixes separated by underscores (e.g. folderName_suffix.parquet).
+    Finds corresponding ROOT files for Parquet files. 
+    Matches against both File Type A (named after folder) and Type B (named after file).
+    Allows Parquet files to have extra suffixes separated by underscores.
     """
     root_base = Path(root_base_folder)
     
-    # 1. Build an index of ONLY the .root files, keyed by their parent folder name.
+    # 1. Build TWO indices of the .root files
     print(f"Scanning for .root files in {root_base}...")
-    root_index = defaultdict(list)
+    root_index_by_folder = defaultdict(list)
+    root_index_by_file = defaultdict(list)
     
     for root_file in root_base.rglob("*.root"):
-        parent_folder_name = root_file.parent.name
-        root_index[parent_folder_name].append(str(root_file))
+        root_index_by_folder[root_file.parent.name].append(str(root_file))
+        root_index_by_file[root_file.stem].append(str(root_file))
 
     # 2. Match Parquet files to the found ROOT files
     matched_root_files = []
@@ -2095,32 +2274,37 @@ def get_matching_root_files(parquet_files, root_base_folder):
     for pq_file in parquet_files:
         pq_stem = Path(pq_file).stem  # e.g., 'data_run_123_v2'
         
-        # Strategy to find the matching folder name:
-        target_folder = None
-        
+        # Helper function to check both dictionaries
+        def find_match(candidate_name):
+            # Check Type B first (exact file name match is a stronger signal)
+            if candidate_name in root_index_by_file:
+                return root_index_by_file[candidate_name]
+            # Then check Type A (folder name match)
+            if candidate_name in root_index_by_folder:
+                return root_index_by_folder[candidate_name]
+            return None
+            
         # Check exact match first
-        if pq_stem in root_index:
-            target_folder = pq_stem
-        else:
-            # If no exact match, progressively drop suffixes from the right
-            # e.g., 'data_run_123_v2' -> tries 'data_run_123'
+        available_roots = find_match(pq_stem)
+        
+        # If no exact match, progressively drop suffixes from the right
+        # e.g., 'data_run_123_v2' -> tries 'data_run_123'
+        if not available_roots:
             parts = pq_stem.split('_')
             for i in range(len(parts) - 1, 0, -1):
                 candidate = '_'.join(parts[:i])
-                if candidate in root_index:
-                    target_folder = candidate
-                    break  # Found the longest matching folder name!
+                available_roots = find_match(candidate)
+                if available_roots:
+                    break  # Found a match after stripping suffixes!
 
         # 3. Retrieve the matched files
-        if target_folder:
-            available_roots = root_index[target_folder]
-            
+        if available_roots:
             if len(available_roots) > 1:
-                print(f"Warning: Multiple .root files found for folder '{target_folder}'. Using {available_roots[0]}")
+                print(f"Warning: Multiple .root files found for '{pq_stem}'. Using {available_roots[0]}")
                 
             matched_root_files.append(available_roots[0])
         else:
-            print(f"Warning: Could not find a matching .root folder for '{pq_stem}'.")
+            print(f"Warning: Could not find a matching .root file or folder for '{pq_stem}'.")
             matched_root_files.append(None)
             
     return matched_root_files
@@ -2214,37 +2398,75 @@ def plot_hexbin(ax, x, y, title, xlabel, ylabel, fig):
 
 
 def plot_signals(axes, root_filepath, target_channel, num_samples, device, valid_indices=None):
-    """Extracts ROOT signals and plots them across the provided axes."""
+    """Extracts ROOT signals and plots them across the provided axes. 
+    Automatically adapts to Type A (Events, negative peaks) and Type B (Data_R, positive peaks)."""
+    
     if not (root_filepath and Path(root_filepath).exists()):
         for ax in axes: ax.text(0.5, 0.5, "File missing", ha='center')
         return
 
+    filepath_str = str(root_filepath)
+    is_positive_peak = False
+
+    # 1. FILE TYPE INSPECTION AND DATA EXTRACTION
     try:
-        with uproot.open(root_filepath) as f:
-            tree = f['Events']
-            if target_channel in tree.keys():
-                samples_matrix = tree[target_channel].array(library="np")
-                total_rows = len(samples_matrix)
-                
-                # Get the pool of indices to search through
-                if valid_indices is not None and len(valid_indices) > 0:
-                    search_indices = np.array(valid_indices)
+        with uproot.open(filepath_str) as f:
+            base_keys = [k.split(';')[0] for k in f.keys()]
+            
+            # --- TYPE A: Events Tree ---
+            if 'Events' in base_keys:
+                tree = f['Events']
+                if target_channel in tree.keys():
+                    samples_matrix = tree[target_channel].array(library="np")
                 else:
-                    search_indices = np.arange(total_rows)
+                    for ax in axes: ax.text(0.5, 0.5, "Channel not found", ha='center')
+                    return
                     
-                # Shuffle so we search randomly
-                np.random.shuffle(search_indices)
+            # --- TYPE B: Data_R Trees ---
+            elif any(k.startswith('Data_R') for k in base_keys):
+                is_positive_peak = True
+                data_r_keys = [k for k in f.keys() if k.startswith("Data_R")]
+                
+                # Convert "ch0" to 0 for filtering
+                ch_num = int(target_channel.replace("ch", ""))
+                
+                samples_list = []
+                for k in data_r_keys:
+                    for chunk in uproot.iterate({filepath_str: k}, filter_name=["Samples", "Channel"], library="np", step_size="100 MB"):
+                        mask = (chunk["Channel"] == ch_num)
+                        waves = chunk["Samples"][mask]
+                        if len(waves) > 0:
+                            if waves.dtype == 'O': waves = np.vstack(waves)
+                            samples_list.append(waves)
+                
+                if not samples_list:
+                    for ax in axes: ax.text(0.5, 0.5, "Channel not found", ha='center')
+                    return
+                samples_matrix = np.vstack(samples_list)
+                
             else:
-                for ax in axes: ax.text(0.5, 0.5, "Channel not found", ha='center')
+                for ax in axes: ax.text(0.5, 0.5, "Unrecognized ROOT structure", ha='center')
                 return
+                
+            # Randomization and Indexing
+            total_rows = len(samples_matrix)
+            if valid_indices is not None and len(valid_indices) > 0:
+                # Filter out any indices that might exceed our extracted array
+                valid_indices = [idx for idx in valid_indices if idx < total_rows]
+                search_indices = np.array(valid_indices) if valid_indices else np.arange(total_rows)
+            else:
+                search_indices = np.arange(total_rows)
+                
+            np.random.shuffle(search_indices)
+            
     except Exception as e:
         print(f"Error reading ROOT file {root_filepath}: {e}")
         return
 
+    # 2. PLOTTING LOOP
     plotted_count = 0
     
     for row_idx in search_indices:
-        # Stop if we've filled all our axes
         if plotted_count >= len(axes) or plotted_count >= num_samples:
             break
             
@@ -2264,24 +2486,47 @@ def plot_signals(axes, root_filepath, target_channel, num_samples, device, valid
             bkg_start, bkg_end = baseline_start_64, baseline_end_64
             start_indx, end_indx = max(0, peak_start_64), min(len(t), peak_end_64)
 
+        # Skip if array is too short for the windows
+        if bkg_end > len(sig) or end_indx > len(sig):
+            continue
+
         bkg_sig = sig[bkg_start:bkg_end]
         baseline_val = np.mean(bkg_sig) if len(bkg_sig) > 0 else 0
         sigma_val = np.std(bkg_sig, ddof=1) if len(bkg_sig) > 1 else 0.0
 
-        # Extract the signal in the window
         sig_window_initial = sig[start_indx:end_indx]
-        
         if len(sig_window_initial) == 0:
             continue
             
-        # --- STRICT NEGATIVE 3-SIGMA CHECK ---
-        min_val = np.min(sig_window_initial)
-        
-        # If the minimum value doesn't drop below the baseline minus 3 sigma, skip it
-        if min_val > (baseline_val - 3 * sigma_val):
-            continue 
-        # -------------------------------------
+        # 3. DYNAMIC PEAK FINDING (Positive vs Negative)
+        if is_positive_peak:
+            # --- POSITIVE PEAK LOGIC (Type B) ---
+            peak_val = np.max(sig_window_initial)
+            if peak_val < (baseline_val + 3 * sigma_val): 
+                continue 
+                
+            peak_idx = start_indx + np.argmax(sig_window_initial)
+            
+            ext_start, ext_end = peak_idx, peak_idx
+            while ext_start > 0 and sig[ext_start] > baseline_val: ext_start -= 1
+            while ext_end < len(sig) - 1 and sig[ext_end] > baseline_val: ext_end += 1
+            
+            fill_condition = (sig[ext_start:ext_end + 1] > baseline_val)
+        else:
+            # --- NEGATIVE PEAK LOGIC (Type A) ---
+            peak_val = np.min(sig_window_initial)
+            if peak_val > (baseline_val - 3 * sigma_val): 
+                continue 
+                
+            peak_idx = start_indx + np.argmin(sig_window_initial)
+            
+            ext_start, ext_end = peak_idx, peak_idx
+            while ext_start > 0 and sig[ext_start] < baseline_val: ext_start -= 1
+            while ext_end < len(sig) - 1 and sig[ext_end] < baseline_val: ext_end += 1
+            
+            fill_condition = (sig[ext_start:ext_end + 1] < baseline_val)
 
+        # 4. RENDER PLOT
         ax_sig = axes[plotted_count]
         
         ax_sig.plot(t, sig, label=f'Signal Row {row_idx}', color='blue')
@@ -2289,7 +2534,6 @@ def plot_signals(axes, root_filepath, target_channel, num_samples, device, valid
         ax_sig.axhline(y=baseline_val + sigma_val, color='orange', linestyle='--', label='+/- 1 Sigma')
         ax_sig.axhline(y=baseline_val - sigma_val, color='orange', linestyle='--')
         
-        # 3-Sigma Threshold Lines
         ax_sig.axhline(y=baseline_val + 3*sigma_val, color='red', linestyle=':', label='+/- 3 Sigma')
         ax_sig.axhline(y=baseline_val - 3*sigma_val, color='red', linestyle=':')
         
@@ -2298,21 +2542,12 @@ def plot_signals(axes, root_filepath, target_channel, num_samples, device, valid
         if 0 <= end_indx - 1 < len(t):
             ax_sig.axvline(x=t[end_indx - 1], color='black', linestyle='--')
 
-        # --- STRICT NEGATIVE PEAK FINDING & FILLING ---
-        peak_idx = start_indx + np.argmin(sig_window_initial)
-        
-        ext_start, ext_end = peak_idx, peak_idx
-        while ext_start > 0 and sig[ext_start] < baseline_val: ext_start -= 1
-        while ext_end < len(sig) - 1 and sig[ext_end] < baseline_val: ext_end += 1
-
         t_window = t[ext_start:ext_end + 1]
         sig_window = sig[ext_start:ext_end + 1]
-        fill_condition = (sig_window < baseline_val)
 
         if len(t_window) > 0:
             ax_sig.fill_between(t_window, sig_window, baseline_val, where=fill_condition, 
                               color='purple', alpha=0.3, interpolate=True)
-        # ----------------------------------------------
     
         ax_sig.set_title(f"Sample {plotted_count+1} (Row {row_idx})", fontsize=10)
         ax_sig.set_xlabel('Samples')
@@ -2322,9 +2557,9 @@ def plot_signals(axes, root_filepath, target_channel, num_samples, device, valid
         
         plotted_count += 1
 
-    # Fill any remaining axes with blank text if we couldn't find enough valid peaks
+    # Fill any remaining axes with blank text
     for i in range(plotted_count, len(axes)):
-        axes[i].text(0.5, 0.5, "No more <-3 sigma samples available", ha='center', va='center', transform=axes[i].transAxes)
+        axes[i].text(0.5, 0.5, "No more +/-3 sigma samples available", ha='center', va='center', transform=axes[i].transAxes)
 
 
 # ==========================================
@@ -2924,87 +3159,98 @@ def filter_extreme_outliers(data, multiplier=5.0):
 
 
 
-
-
 def _extract_params(name_string):
-    """Helper function to apply all regex searches to a given string."""
+    """
+    Helper function to apply all regex searches to a given string.
+    Automatically handles both Type A (hyphenated) and Type B (underscored) formats.
+    """
     metadata = {}
     
-    # 1. Extract Timestamp
-    timestamp_match = re.match(r"^(\d{8}T\d{6}Z)", name_string)
+    # Lowercase everything for easier regex matching (handles 'V' vs 'v', 'C' vs 'c')
+    ns = name_string.lower()
+    
+    # Auto-detect file format: Type B uses underscores, Type A uses only hyphens
+    is_type_b = "_" in ns
+    
+    # 1. Extract Timestamp (Typically Type A only)
+    timestamp_match = re.match(r"^(\d{8}t\d{6}z)", ns)
     if timestamp_match:
-        metadata["timestamp"] = timestamp_match.group(1)
+        metadata["timestamp"] = timestamp_match.group(1).upper()
         
-    # 2. Extract Channel Type
-    ch_match = re.search(r"(single-ch|multi-ch)", name_string)
-    if ch_match:
-        metadata["channel_type"] = ch_match.group(1)
-        
-    # 3. Extract voltages (e.g., 54v, 3v)
-    voltages = re.findall(r"-(\d+(?:\.\d+)?)v", name_string)
-    if len(voltages) >= 1:
-        metadata["bias_voltage"] = float(voltages[0])  
-    if len(voltages) >= 2:
-        metadata["pulse_voltage"] = float(voltages[1])
-        
-    # 4. Extract Frequency (e.g., 400hz)
-    freq_match = re.search(r"[-_](\d+)[hH][zZ]", name_string)
-    if freq_match:
-        metadata["frequency_hz"] = float(freq_match.group(1))
-        
-    # 5. Extract Time window/pulse width (e.g., 10ns)
-    time_match = re.search(r"-(\d+)ns", name_string)
-    if time_match:
-        metadata["time_ns"] = float(time_match.group(1))
-        
-    # 6. Extract Temp/Condition (e.g., 100c)
-    temp_match = re.search(r"-(-?\d+)c-", name_string)
-    if temp_match:
-        temp_val = float(temp_match.group(1))
-    
-        # If the temperature is above 40, automatically make it negative
-        if temp_val > 40:
-            temp_val = -temp_val
-        
-        metadata["temp_c"] = temp_val
-        
-    # 7. Extract the unique trailing hash (e.g., 5192c7fd)
-    hash_match = re.search(r"-([a-f0-9]{8})$", name_string)
-    if hash_match:
-        metadata["run_hash"] = hash_match.group(1)
-
-    # 8. Extract the LED voltage 
-    all_voltages = re.findall(r"[-_]([0-9]+(?:[-.][0-9]+)?)[vV]", name_string)
-    if all_voltages:
-        last_voltage_str = all_voltages[-1].replace("-", ".")
-        metadata["led_voltage"] = float(last_voltage_str)
-        
-    # 9. Check for dark_count
-    if re.search(r"dark[_\-]?count", name_string, re.IGNORECASE):
-        metadata["is_dark_count"] = True
-
-    # 10. Extract Amplifier Range (e.g., -0-5-3- before the bias voltage)
-    amp_match = re.search(r"-(\d+(?:-\d+)?)-(\d+(?:-\d+)?)-(?=\d+(?:-\d+|\.\d+)?[vV])", name_string)
-    
-    if amp_match:
-        # Replace the hyphen decimal with a dot (e.g., "0-5" -> "0.5", "3" -> "3.0")
-        min_val = float(amp_match.group(1).replace("-", "."))
-        max_val = float(amp_match.group(2).replace("-", "."))
-        
-        # Since the first value is implicitly negative in your convention (-0.5V to +3V)
-        metadata["amp_min_v"] = -min_val
-        metadata["amp_max_v"] = max_val
-        
-    # 11. Extract MULTI / SINGLE / SGL / SE-MULTI mode
-    # Placed se-multi first so it matches the whole string instead of just 'multi'
-    mode_match = re.search(r"(se-multi|multi|single|sgl)", name_string, re.IGNORECASE)
+    # 2 & 11. Extract Channel Type / Mode
+    mode_match = re.search(r"(se[-_]multi|multi|single|sgl)", ns)
     if mode_match:
-        mode_str = mode_match.group(1).upper()
-        # Normalize SGL to SINGLE for consistency
+        mode_str = mode_match.group(1).replace('_', '-').upper()
         if mode_str == "SGL":
             mode_str = "SINGLE"
         metadata["mode"] = mode_str
+        metadata["channel_type"] = mode_str.lower() + "-ch"
+
+    # 3 & 8. Extract Voltages (Bias and LED/Pulse)
+    # Looks for matches like "-54v", "_54v", "-2-89v", "_3.1v"
+    all_voltages = re.findall(r"[-_]([0-9]+(?:[-.][0-9]+)?)[v]", ns)
+    if all_voltages:
+        # Helper to parse float based on the file format
+        def parse_v(v_str):
+            return float(v_str) if is_type_b else float(v_str.replace("-", "."))
+            
+        metadata["bias_voltage"] = parse_v(all_voltages[0])
         
+        if len(all_voltages) >= 2:
+            led_v = parse_v(all_voltages[-1])
+            metadata["pulse_voltage"] = led_v
+            metadata["led_voltage"] = led_v
+
+    # 4. Extract Frequency (handles hz and khz)
+    freq_match = re.search(r"[-_](\d+)(k?)hz", ns)
+    if freq_match:
+        val = float(freq_match.group(1))
+        is_kilo = freq_match.group(2) == 'k'
+        metadata["frequency_hz"] = val * 1000 if is_kilo else val
+
+    # 5. Extract Time window/pulse width
+    time_match = re.search(r"[-_](\d+)ns", ns)
+    if time_match:
+        metadata["time_ns"] = float(time_match.group(1))
+
+    # 6. Extract Temp/Condition
+    temp_match = re.search(r"[-_](-?\d+)c(?:[-_]|$)", ns)
+    if temp_match:
+        temp_val = float(temp_match.group(1))
+        # Type A stores "160" but implies -160. Type B explicitly stores "-120".
+        if temp_val > 40:
+            temp_val = -temp_val
+        metadata["temp_c"] = temp_val
+
+    # 7. Extract the unique trailing hash (Type A only)
+    hash_match = re.search(r"-([a-f0-9]{8})$", ns)
+    if hash_match:
+        metadata["run_hash"] = hash_match.group(1)
+
+    # 9. Check for dark_count
+    if re.search(r"dark[-_]?count", ns):
+        metadata["is_dark_count"] = True
+
+    # 10. Extract Amplifier Range 
+    # Finds the two sets of numbers between the 'c' (temp) and the 'v' (bias voltage)
+    amp_match = re.search(r"c[-_]([+-]?\d+(?:[-.]\d+)?)[-_]([+-]?\d+(?:[-.]\d+)?)[-_](?=\d+(?:[-.]\d+)?[v])", ns)
+    
+    if amp_match:
+        val1_str = amp_match.group(1)
+        val2_str = amp_match.group(2)
+        
+        if is_type_b:
+            # Type B has explicit signs and explicit decimal dots (e.g., "+0.5" and "-3")
+            val1, val2 = float(val1_str), float(val2_str)
+            metadata["amp_min_v"] = min(val1, val2)
+            metadata["amp_max_v"] = max(val1, val2)
+        else:
+            # Type A uses hyphens for decimals (e.g., "0-5" and "2-5") and implicit negative min
+            val1 = float(val1_str.replace("-", "."))
+            val2 = float(val2_str.replace("-", "."))
+            metadata["amp_min_v"] = -val1
+            metadata["amp_max_v"] = val2
+
     return metadata
 
 
@@ -3014,15 +3260,12 @@ def parse_folder_metadata(filepath):
     falling back to the file name if a parameter is missing.
     """
     folder_name = os.path.basename(os.path.dirname(filepath))
-    
-    # Grab file name but strip the extension (e.g. ".csv"). 
     file_name = os.path.splitext(os.path.basename(filepath))[0]
     
-    # Extract parameters from both
     file_meta = _extract_params(file_name)
     folder_meta = _extract_params(folder_name)
     
-    # Merge them. **file_meta sets the defaults, **folder_meta overwrites them.
+    # **file_meta sets the defaults, **folder_meta overwrites them.
     metadata = {
         "raw_folder_name": folder_name,
         **file_meta,
